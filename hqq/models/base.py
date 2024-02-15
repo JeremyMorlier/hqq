@@ -6,7 +6,7 @@ from tqdm import tqdm
 from abc import abstractmethod
 
 from huggingface_hub import snapshot_download
-from ..core.quantize import HQQLinear
+from ..core.quantize import HQQLinear, HQQConv2d
 
 #Cleanup GPU vram
 def cleanup():
@@ -30,6 +30,11 @@ class BasePatch():
 	#This method iterates through layers of the model that are nn.Linear and processes them via new_nodule = patch_fct(module, params)
 	@classmethod
 	def patch_linearlayers(cls, base_model, patch_fct, patch_params, verbose=True):
+		pass 
+
+	#This method iterates through layers of the model that are nn.Linear and processes them via new_nodule = patch_fct(module, params)
+	@classmethod
+	def patch_conv2dlayers(cls, base_model, patch_fct, patch_params, verbose=True):
 		pass 
 	############################################
 	#These tags are used to specfiy parameters of the patching in  patch_linearlayers()
@@ -56,10 +61,11 @@ class BasePatch():
 
 	#Main patching function
 	@classmethod
-	def patch_model(cls, model, patch_nonlinear_fct, patch_linear_fct, patch_params, verbose=True):
+	def patch_model(cls, model, patch_nonlinear_fct, patch_conv2d_fct, patch_linear_fct, patch_params, verbose=True):
 		model.eval()
 		cls.freeze_model(model)
 		cls.patch_nonlinearlayers(model, patch_nonlinear_fct, verbose=verbose)
+		cls.patch_conv2dlayers(model, patch_conv2d_fct, patch_params, verbose=verbose)
 		cls.patch_linearlayers(model, patch_linear_fct, patch_params, verbose=verbose)
 		cls.autoname_modules(model)
 		cleanup()
@@ -116,8 +122,12 @@ class BaseHQQModel:
 		#We replace the nn.Linear layers with HQQLinear
 		def _patch_linear(linear_layer, quant_config):
 			return HQQLinear(linear_layer, quant_config, compute_dtype=compute_dtype) if (quant_config is not None) else linear_layer.to(compute_dtype).cuda()
+		
+		# Replace Conv2d with HQQConv2d
+		def _patch_conv2d(conv_layer, quant_config) :
+			return HQQConv2d(conv_layer, quant_config, compute_dtype=compute_dtype) if (quant_config is not None) else conv_layer.to(compute_dtype).cuda()
 
-		cls.patch_model(model, lambda l: l.to(compute_dtype).cuda(), _patch_linear, patch_params)
+		cls.patch_model(model, lambda l: l.to(compute_dtype).cuda(),_patch_conv2d, _patch_linear, patch_params)
 
 	#Prepares model weights by iterating through modules. It might some parameters that are NOT modules like model.param1
 	@classmethod

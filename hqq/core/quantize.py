@@ -1,6 +1,7 @@
 #Written by Dr. Hicham Badri @Mobius Labs GmbH - 2023
 #####################################################
 import torch
+import torch.nn.functional as F
 import numpy as np 
 
 from .utils    import *
@@ -210,6 +211,37 @@ class HQQMatmulNoCacheMul(torch.autograd.Function):
 
 		return grad_input, grad_weight, grad_bias
 
+class HQQConv2dNoCacheMul(torch.autograd.Function):
+
+	@staticmethod
+	def forward(x, conv2d, bias):
+		out = conv2d(x)
+		if(bias!=None): out += bias
+		return out
+
+	@staticmethod
+	def setup_context(ctx, inputs, outputs):
+		x, matmul, bias = inputs
+		ctx.save_for_backward(x, bias)
+		ctx.matmul = matmul
+
+	@staticmethod
+	def backward(ctx, grad_output):
+		x, bias    = ctx.saved_tensors
+
+		grad_input = grad_weight = grad_bias = None
+
+		if ctx.needs_input_grad[0]:
+			grad_input = ctx.matmul(grad_output, transpose=False)
+
+		# weight grad for frozen quantized weights not defined
+		# if ctx.needs_input_grad[1]:
+		# 	grad_weight = torch.matmul(grad_output.t(), x)
+
+		if bias is not None and ctx.needs_input_grad[2]:
+			grad_bias = grad_output.sum(0)
+
+		return grad_input, grad_weight, grad_bias
 #Cache dequantized tensor: Faster but needs more memory
 class HQQMatmulCachedDeq(torch.autograd.Function):
 
@@ -410,44 +442,135 @@ class HQQLinear(torch.nn.Module):
 		return HQQMatmulNoCacheDeq.apply(x, self.dequantize_aten, self.bias)
 
 
-	# def forward_aten(self, x):
-	# 	empt = torch.empty([0])
-	# 	W_q  = self.W_q
-	# 	meta = self.meta
-	# 	bias = self.bias
+#Main Conv2d layer 
+class HQQConv2d(torch.nn.Module):
+	backend = HQQBackend.PYTORCH #Default
 
-	# 	W_q, W_s, W_z              = W_q,  empt if (meta['quant_scale']) else meta['scale'], empt if (meta['quant_zero']) else meta['zero']
-	# 	W_shape,  W_group_size     = meta['shape'], meta['group_size']
-	# 	W_nbits, W_axis, W_packing = meta['nbits'], meta['axis'], meta['packing']
+	def __init__(self, conv2d_layer, quant_config, del_orig=True, compute_dtype=torch.float16, device_n=0):
+		super().__init__()
+		self.ready         = False
+		self.in_gpu        = False
+		self.device        = None
+		self.bias          = None
+		self.device_n      = device_n
+		self.compute_dtype = compute_dtype
+		self.quant_config  = quant_config
+		self.set_backend(HQQLinear.backend) #Default backend
 
-	# 	if(meta['quant_scale']):
-	# 		S_q, S_s, S_z              = meta['scale_q'],             meta['meta_scale']['scale'], meta['meta_scale']['zero']
-	# 		S_shape, S_group_size      = meta['meta_scale']['shape'], meta['meta_scale']['group_size'] 
-	# 		S_nbits, S_axis, S_packing = meta['meta_scale']['nbits'], meta['meta_scale']['axis'],  meta['meta_scale']['packing']
-	# 	else:
-	# 		S_q, S_s, S_z              = empt, empt, empt
-	# 		S_shape, S_group_size      = meta['shape'], -1
-	# 		S_nbits, S_axis, S_packing = -1, 0, ""
+		if(conv2d_layer is not None):
+			self.bias = None if (conv2d_layer.bias==None) else conv2d_layer.bias.to(self.compute_dtype).cuda()
+			self.stride, self.padding, self.dilation, self.groups = conv2d_layer.stride, conv2d_layer.padding, conv2d_layer.dilation, conv2d_layer.groups
+			self.quantize(conv2d_layer.weight.data, **quant_config)
 
-	# 	if(meta['quant_zero']):
-	# 		Z_q, Z_s, Z_z              = meta['zero_q'],             meta['meta_zero']['scale'], meta['meta_zero']['zero']
-	# 		Z_shape, Z_group_size      = meta['meta_zero']['shape'], meta['meta_zero']['group_size']
-	# 		Z_nbits, Z_axis, Z_packing = meta['meta_zero']['nbits'], meta['meta_zero']['axis'],  meta['meta_zero']['packing']
-	# 	else:
-	# 		S_q, S_s, S_z              = empt, empt, empt
-	# 		S_shape, S_group_size      = meta['shape'], -1
-	# 		S_nbits, S_axis, S_packing = -1, 0, ""
+		if(del_orig): del conv2d_layer
+		torch.cuda.empty_cache()
 
+	#Set backends
+	@classmethod
+	def set_backend(cls, backend: HQQBackend):
+		HQQLinear.backend = backend
+		cls.forward       = getattr(cls, backend.value)
 
-	# 	S_group_size = 0 if (S_group_size==None) else S_group_size
-	# 	Z_group_size = 0 if (Z_group_size==None) else Z_group_size
+	def cuda(self, device_n=0):
+		if(self.in_gpu): return 
+		self.meta['compute_dtype'] = self.compute_dtype 
+		self.W_q, self.meta = Quantizer.cuda(self.W_q, self.meta, device_n)
+		if(self.meta['quant_scale']):
+			self.meta['scale_q'] , self.meta['meta_scale'] = Quantizer.cuda(self.meta['scale_q'], self.meta['meta_scale'], device_n)
+		if(self.meta['quant_zero']):
+			self.meta['zero_q'] , self.meta['meta_zero']   = Quantizer.cuda(self.meta['zero_q'], self.meta['meta_zero'], device_n)
 
-	# 	args = [x, bias if (bias is not None) else empt,
-	# 			W_q, W_s, W_z, W_shape, W_group_size, W_nbits, W_axis, W_packing,
-	# 			S_q, S_s, S_z, S_shape, S_group_size, S_nbits, S_axis, S_packing,
-	# 			Z_q, Z_s, Z_z, Z_shape, Z_group_size, Z_nbits, Z_axis, Z_packing]
+		if(self.bias is not None):
+			self.bias = self.bias.to(self.compute_dtype).cuda(device_n)
 
-	# 	return hqq_aten.forward_with_quant(*args)
+		self.W_q    = torch.nn.Parameter(self.W_q, requires_grad=False)
+		self.device = self.W_q.device
+		self.in_gpu = True
+
+	def to(self, *args, **kwargs):
+		pass
+
+	def half(self, *args, **kwargs):
+		return self 
+
+	def state_dict(self):
+		return {'W_q':self.W_q, 'meta':self.meta, 'bias':self.bias}
+
+	def load_state_dict(self, state_dict):
+		self.W_q    = state_dict['W_q']
+		self.meta   = state_dict['meta']
+		self.bias   = state_dict['bias'] if ('bias' in state_dict) else None
+		self.in_gpu = self.W_q.device.type == 'cuda'
+		if(self.in_gpu): 
+			if('scale' in self.meta):
+				self.meta['scale'] = self.meta['scale'].to(self.compute_dtype)
+			if('zero' in self.meta):
+				self.meta['zero']  = self.meta['zero'].to(self.compute_dtype)
+		else:
+			self.cuda(self.device_n)
+		self.ready  = True
+
+	#@torch.inference_mode()
+	def quantize(self, W, weight_quant_params, scale_quant_params, zero_quant_params):
+		quant_scale = scale_quant_params is not None
+		quant_zero  = zero_quant_params  is not None
+
+		self.in_features, self.out_features = W.t().shape
+		
+		#Quantize
+		W_q , meta = Quantizer.quantize(W, **weight_quant_params) 
+		meta.update({'quant_scale':quant_scale, 'quant_zero':quant_zero})
+		if(meta['quant_scale']):
+			meta['scale_q'] , meta['meta_scale'] = Quantizer.quantize(meta['scale'], **scale_quant_params); del meta['scale']
+			meta['meta_scale']['compute_dtype']  = self.compute_dtype
+		if(meta['quant_zero']):
+			meta['zero_q'], meta['meta_zero']    = Quantizer.quantize(meta['zero'],  **zero_quant_params);  del meta['zero']
+			meta['meta_zero']['compute_dtype']   = self.compute_dtype
+
+		self.W_q   = W_q
+		self.meta  = meta 
+		self.cuda(self.device_n)
+		self.ready = True
+
+	def dequantize(self):
+		assert self.ready, "model was not quantized"
+		W_q, meta = self.W_q, self.meta
+
+		del_keys = []
+		if(meta['quant_scale']):
+			meta['scale'] = Quantizer.dequantize(meta['scale_q'], meta['meta_scale']); del_keys.append('scale')
+		if(meta['quant_zero']):
+			meta['zero']  = Quantizer.dequantize(meta['zero_q'],  meta['meta_zero']);  del_keys.append('zero')
+
+		W_est = Quantizer.dequantize(W_q, meta)
+
+		#Cleanup
+		for key in del_keys: del meta[key]
+		return W_est
+
+	def conv2d(self, x, transpose=True):
+		weight = self.dequantize() 
+		return F.conv2d(x, weight, bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
+
+	@torch.compile()
+	def conv2d_compile(self, *args, **kwargs):
+		return self.conv2d(*args, **kwargs)
+
+	def forward_pytorch_backprop(self, x):
+		return HQQConv2dNoCacheMul.apply(x, self.conv2d, self.bias)
+
+	def forward_pytorch_backprop_compile(self, x):
+		return HQQConv2dNoCacheMul.apply(x, self.conv2d_compile, self.bias)
+
+	def forward_pytorch(self, x): 
+		out = torch.conv2d(x, self.dequantize(), bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
+		if(self.bias is not None):
+			out += self.bias
+		return out
+
+	@torch.compile()
+	def forward_pytorch_compile(self, x): 
+		return self.forward_pytorch(x)
 
 
 def hqq_base_quant_config(nbits=4, group_size=64, quant_zero=True, quant_scale=False):
