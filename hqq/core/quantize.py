@@ -459,11 +459,25 @@ class HQQConv2d(torch.nn.Module):
 
 		if(conv2d_layer is not None):
 			self.bias = None if (conv2d_layer.bias==None) else conv2d_layer.bias.to(self.compute_dtype).cuda()
+			self.in_channels, self.out_channels = conv2d_layer.in_channels, conv2d_layer.out_channels
+			self.kernel_size = conv2d_layer.kernel_size
 			self.stride, self.padding, self.dilation, self.groups = conv2d_layer.stride, conv2d_layer.padding, conv2d_layer.dilation, conv2d_layer.groups
 			self.quantize(conv2d_layer.weight.data, **quant_config)
 
 		if(del_orig): del conv2d_layer
 		torch.cuda.empty_cache()
+
+	def extra_repr(self):
+		s = f'{self.in_channels},  {self.out_channels}, kernel_size={self.kernel_size}, stride={self.stride}'
+		if self.padding != (0,) * len(self.padding):
+			s += f', padding={self.padding}'
+		if self.dilation != (1,) * len(self.dilation):
+			s += f', dilation={self.dilation}'
+		if self.groups != 1:
+			s += f', groups={self.groups}'
+		if self.bias is None:
+			s += f', bias=False'
+		return s
 
 	#Set backends
 	@classmethod
@@ -515,7 +529,7 @@ class HQQConv2d(torch.nn.Module):
 		quant_scale = scale_quant_params is not None
 		quant_zero  = zero_quant_params  is not None
 
-		self.in_features, self.out_features = W.t().shape
+		#self.in_features, self.out_features = W.t().shape
 		
 		#Quantize
 		W_q , meta = Quantizer.quantize(W, **weight_quant_params) 
